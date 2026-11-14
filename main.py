@@ -1,103 +1,120 @@
-"""food-picture-01 entry V2 (Python 3.13, standard library only).
+#!/usr/bin/env python3
+"""Ship the bundled still image as this competition's entry.
 
-Image: "Midnight Tonkotsu: The Golden Lift" — steaming tonkotsu ramen,
-45-degree three-quarter view, chopsticks lifting a tall tangle of glossy
-noodles, molten ajitama yolk, black-garlic oil swirl, 1024x1024 JPEG.
-
-The program copies the image held in this repository (image.jpg, beside
-this file) to the output directory as entry.png. The gate accepts a whole
-PNG or JPEG of at most 1 MiB and 1024 by 1024 pixels, and the judge sees
-exactly the bytes copied, so the copy must be byte-for-byte identical.
-
-Before copying, the program validates the source against the gate's own
-limits (whole JPEG: SOI marker first, EOI marker last; at most 1 MiB;
-at most 1024 by 1024 pixels) and refuses to write anything invalid,
-so a bad image can never be silently submitted.
-
-After copying, the program reads the written file back and compares its
-bytes with the source, so a truncated or corrupted copy is caught here
-instead of reaching the judge; a mismatch removes the bad output and
-fails cleanly.
-
-Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
-    mkdir -p out && MAKEFUN_OUTPUT_DIR=out python3 main.py
+The entry itself is one photograph, already finished.  This program
+does not edit a single pixel: it sanity-checks the bundled JPEG and
+then copies its bytes verbatim into the output folder under the name
+entry.png.  Only the standard library is used, nothing is fetched
+from the network, and the same input always yields the same output.
 """
 
 import os
-import shutil
 import sys
 
-MAX_BYTES = 1_048_576
-MAX_WIDTH = 1024
-MAX_HEIGHT = 1024
 
-SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "image.jpg")
+# Hard ceilings from the competition rules.
+MAX_FILE_SIZE = 1024 * 1024
+MAX_SIDE = 1024
+
+JPEG_SOI = b"\xff\xd8"
+JPEG_EOI = b"\xff\xd9"
+
+# Markers whose segment carries a frame header.  DHT (0xC4), JPG (0xC8)
+# and DAC (0xCC) are intentionally absent from this set.
+FRAME_MARKERS = frozenset(
+    [0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+     0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF]
+)
+
+# Markers with no length field at all, so a walker must never try to
+# skip past them by reading a size.
+LENGTHLESS = frozenset([0x01] + list(range(0xD0, 0xD8)))
 
 
-def jpeg_dimensions(data: bytes) -> tuple[int, int]:
-    """Return (width, height) of a JPEG from its SOF0/SOF2 segment."""
-    if len(data) < 2 or data[0:2] != b"\xff\xd8":
-        raise ValueError("not a JPEG (missing SOI marker)")
-    if data[-2:] != b"\xff\xd9":
-        raise ValueError("not a whole JPEG (missing EOI marker)")
-    i = 2
-    while i + 1 < len(data):
-        if data[i] != 0xFF:
-            raise ValueError("corrupt JPEG segment at offset %d" % i)
-        marker = data[i + 1]
-        # Standalone markers carry no length field.
-        if marker in (0x01, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8):
-            i += 2
+def complain(text):
+    """Report a problem on stderr and signal failure with exit code 1."""
+    print("error: " + text, file=sys.stderr)
+    return 1
+
+
+def measure_frame(picture):
+    """Walk JPEG segments and return (width, height) of the first frame.
+
+    Returns None when no frame header is found before the scan data
+    begins, or when any segment looks truncated or malformed.
+    """
+    cursor = 2  # the two SOI bytes have already been verified
+    total = len(picture)
+    while cursor + 1 < total:
+        if picture[cursor] != 0xFF:
+            cursor += 1
             continue
-        if i + 4 > len(data):
-            raise ValueError("truncated JPEG segment")
-        length = (data[i + 2] << 8) | data[i + 3]
-        if marker in (0xC0, 0xC2):  # SOF0 / SOF2: precision, height, width
-            if length < 7 or i + 9 > len(data):
-                raise ValueError("truncated SOF segment")
-            height = (data[i + 5] << 8) | data[i + 6]
-            width = (data[i + 7] << 8) | data[i + 8]
-            return width, height
-        if marker == 0xDA:  # SOS: scan data follows; dimensions already read
-            raise ValueError("no SOF segment before scan data")
-        i += 2 + length
-    raise ValueError("no SOF segment found")
+        code = picture[cursor + 1]
+        if code == 0xFF:
+            cursor += 1  # filler byte, not a real marker
+            continue
+        if code == 0x00:
+            cursor += 2  # escaped 0xFF inside compressed data
+            continue
+        if code in LENGTHLESS:
+            cursor += 2
+            continue
+        if code == 0xDA:
+            return None  # start of scan: only entropy data follows
+        if cursor + 4 > total:
+            return None
+        span = (picture[cursor + 2] << 8) | picture[cursor + 3]
+        if span < 2 or cursor + 2 + span > total:
+            return None
+        if code in FRAME_MARKERS:
+            payload = picture[cursor + 4:cursor + 2 + span]
+            if len(payload) < 5:
+                return None
+            tall = (payload[1] << 8) | payload[2]
+            wide = (payload[3] << 8) | payload[4]
+            return wide, tall
+        cursor += 2 + span
+    return None
 
 
-def fail(message: str) -> None:
-    print("error: %s" % message, file=sys.stderr)
-    sys.exit(1)
-
-
-def main() -> None:
-    if not os.path.isfile(SOURCE):
-        fail("source image not found: %s" % SOURCE)
-    with open(SOURCE, "rb") as f:
-        data = f.read()
-    if len(data) > MAX_BYTES:
-        fail("image is %d bytes, over the 1 MiB limit" % len(data))
+def run():
+    folder = os.path.dirname(os.path.abspath(__file__))
+    origin = os.path.join(folder, "image.jpg")
     try:
-        width, height = jpeg_dimensions(data)
-    except ValueError as exc:
-        fail("invalid image: %s" % exc)
-    if width > MAX_WIDTH or height > MAX_HEIGHT:
-        fail("image is %dx%d, over the 1024x1024 limit" % (width, height))
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    if os.path.exists(out_dir) and not os.path.isdir(out_dir):
-        fail("output path is a file, not a directory: %s" % out_dir)
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, "entry.png")
-    # Byte-for-byte copy: the judge must see exactly the source bytes.
-    shutil.copyfile(SOURCE, out_path)
-    with open(out_path, "rb") as f:
-        written = f.read()
-    if written != data:
-        try:
-            os.remove(out_path)
-        except OSError:
-            pass
-        fail("written output does not match the source image")
+        with open(origin, "rb") as handle:
+            picture = handle.read()
+    except OSError as exc:
+        return complain("cannot open image.jpg: %s" % exc)
+
+    if len(picture) > MAX_FILE_SIZE:
+        return complain("image.jpg is larger than 1 MiB")
+    if len(picture) < 4:
+        return complain("image.jpg is too short to be a JPEG")
+    if not picture.startswith(JPEG_SOI):
+        return complain("image.jpg does not start with a JPEG SOI marker")
+    if not picture.endswith(JPEG_EOI):
+        return complain("image.jpg does not end with a JPEG EOI marker")
+
+    frame = measure_frame(picture)
+    if frame is None:
+        return complain("no frame header found inside image.jpg")
+    wide, tall = frame
+    if wide < 1 or tall < 1 or wide > MAX_SIDE or tall > MAX_SIDE:
+        return complain("frame size %dx%d is outside the allowed range"
+                        % (wide, tall))
+
+    destination = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    try:
+        os.makedirs(destination, exist_ok=True)
+        target = os.path.join(destination, "entry.png")
+        with open(target, "wb") as handle:
+            handle.write(picture)
+    except OSError as exc:
+        return complain("cannot write entry.png: %s" % exc)
+
+    print("image.jpg -> entry.png: %dx%d, %d bytes" % (wide, tall, len(picture)))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(run())
