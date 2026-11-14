@@ -87,6 +87,7 @@ def main() -> None:
         fail("output path is a file, not a directory: %s" % out_dir)
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "entry.png")
+    # Byte-for-byte copy: the judge must see exactly the source bytes.
     shutil.copyfile(SOURCE, out_path)
     with open(out_path, "rb") as f:
         written = f.read()
